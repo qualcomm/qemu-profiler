@@ -1,0 +1,120 @@
+name: Integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qemu-integration:
+    name: ${{ matrix.distro }} QEMU ${{ matrix.arch }} integration
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Debian
+            image: debian:trixie
+            family: debian
+            arch: aarch64
+            compiler: aarch64-linux-gnu-gcc
+            qemu: /usr/bin/qemu-aarch64
+            lld_emulation: aarch64elf
+          - distro: Debian
+            image: debian:trixie
+            family: debian
+            arch: riscv64
+            compiler: riscv64-linux-gnu-gcc
+            qemu: /usr/bin/qemu-riscv64
+            lld_emulation: elf64lriscv
+          - distro: Fedora
+            image: fedora:latest
+            family: fedora
+            arch: aarch64
+            compiler: aarch64-linux-gnu-gcc
+            qemu: /usr/bin/qemu-aarch64
+            lld_emulation: aarch64elf
+          - distro: Fedora
+            image: fedora:latest
+            family: fedora
+            arch: riscv64
+            compiler: riscv64-linux-gnu-gcc
+            qemu: /usr/bin/qemu-riscv64
+            lld_emulation: elf64lriscv
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          if [ "${{ matrix.family }}" = debian ]; then
+            apt-get update
+            apt-get install --yes build-essential curl gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu lld llvm qemu-user
+          else
+            dnf install --assumeyes curl gcc gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu lld llvm qemu-user
+          fi
+
+      - name: Install BOLT
+        run: |
+          if [ "${{ matrix.family }}" = debian ]; then
+            llvm_major=$(llvm-config --version | cut -d. -f1)
+            apt-get install --yes "bolt-${llvm_major}"
+          else
+            dnf install --assumeyes bolt
+          fi
+
+      - name: Install Rust toolchain
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+
+      - name: Use stable Rust toolchain
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" default stable
+
+      - name: Build plugin and converter
+        run: |
+          cargo build --release -p qemu-pgo-plugin
+          cargo build --release -p tcg-prof-convert
+
+      - name: Run integration assertions
+        env:
+          PGO_PLUGIN: ${{ github.workspace }}/target/release/libtcg_prof.so
+          QEMU_AARCH64: ${{ matrix.arch == 'aarch64' && matrix.qemu || '' }}
+          QEMU_RISCV64: ${{ matrix.arch == 'riscv64' && matrix.qemu || '' }}
+        run: cargo test --release -p pgo-integration-tests --test multi_arch
+
+      - name: Generate and convert profile
+        run: |
+          mkdir integration-artifacts
+          ${{ matrix.compiler }} -static -O1 -fno-unroll-loops -o integration-artifacts/function_calls tests/integration/fixtures/function_calls.c
+          ${{ matrix.compiler }} -O1 -fno-unroll-loops -c -o integration-artifacts/function_calls.o tests/integration/fixtures/function_calls.c
+          timeout 60s ${{ matrix.qemu }} -plugin target/release/libtcg_prof.so,tier=calls,output=integration-artifacts/profile.pgo integration-artifacts/function_calls
+          target/release/tcg-prof-convert dump --input integration-artifacts/profile.pgo | tee integration-artifacts/dump.txt
+          target/release/tcg-prof-convert bolt --input integration-artifacts/profile.pgo --binary integration-artifacts/function_calls --output integration-artifacts/bolt.txt
+          target/release/tcg-prof-convert autofdo --input integration-artifacts/profile.pgo --binary integration-artifacts/function_calls --output integration-artifacts/autofdo.txt
+          target/release/tcg-prof-convert cgsort --input integration-artifacts/profile.pgo --binary integration-artifacts/function_calls --output integration-artifacts/cgsort.txt
+          target/release/tcg-prof-convert gcc-autofdo --input integration-artifacts/profile.pgo --binary integration-artifacts/function_calls --output integration-artifacts/gcc-autofdo.txt
+          target/release/tcg-prof-convert temporal --input integration-artifacts/profile.pgo --binary integration-artifacts/function_calls --output integration-artifacts/temporal.txt
+          grep -q 'tier=2 (calls)' integration-artifacts/dump.txt
+          grep -q 'clean_exit=true' integration-artifacts/dump.txt
+
+      - name: Verify LLVM profile consumers
+        run: |
+          llvm_bin=$(llvm-config --bindir)
+          "$llvm_bin/llvm-profgen" --unsymbolized-profile=integration-artifacts/autofdo.txt --binary=integration-artifacts/function_calls -o integration-artifacts/sample.prof
+          "$llvm_bin/llvm-profdata" merge --text integration-artifacts/temporal.txt -o integration-artifacts/temporal.profdata
+          "$llvm_bin/ld.lld" -m ${{ matrix.lld_emulation }} -r --call-graph-ordering-file=integration-artifacts/cgsort.txt -o integration-artifacts/ordered.o integration-artifacts/function_calls.o
+
+      - name: Verify BOLT profile consumer
+        if: matrix.arch == 'aarch64'
+        run: |
+          llvm_bin=$(llvm-config --bindir)
+          "$llvm_bin/llvm-bolt" integration-artifacts/function_calls -o integration-artifacts/function_calls.bolt -pa -p integration-artifacts/bolt.txt
